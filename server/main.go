@@ -1,8 +1,9 @@
-package lb
+package server
 
 import (
 	"net/http"
 	"log"
+	"github.com/pupimvictor/simple-load-balancer"
 
 )
 
@@ -12,7 +13,7 @@ func main(){
 	//read endpoints from input
 	endpoints := []string{"http://localhost:9000", "http://localhost:9001"}
 	//new lb
-	lb, err := NewLoadBalancer(endpoints)
+	lb, err := lb.NewLoadBalancer(endpoints)
 	if err != nil {
 		log.Fatalf("unable to start lb - %s", err.Error())
 	}

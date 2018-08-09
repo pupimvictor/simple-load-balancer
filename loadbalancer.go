@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"fmt"
 
+	"strconv"
+	"context"
 )
 
 type LoadBalancer struct{
@@ -47,11 +49,32 @@ func (lb *LoadBalancer) Proxy(w http.ResponseWriter, req *http.Request) {
 
 func (lb *LoadBalancer) BalancerMiddleware(h http.Handler) http.Handler{
 	//responsible for defining the right backend and retry mechanism
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		reqStatus := 0
+		serverInstance := lb.getNextHealthyServerInstance()
+		activeInstance := &serverInstance
+		firstInstanceId := activeInstance.currInstance.id
+		for reqStatus != 200 {
+			reqCtx := context.WithValue(req.Context(), "server-instance", activeInstance.currInstance)
+
+			h.ServeHTTP(rw, req.WithContext(reqCtx))
+			reqStatus, _ = strconv.Atoi(rw.Header().Get("status"))
+
+			activeInstance = activeInstance.nextInstance
+			if activeInstance.currInstance.id == firstInstanceId{
+				break
+			}
+		}
+	})
 }
 
 func (lb *LoadBalancer) LogMiddleware(h http.Handler) http.Handler{
 	//logger middleware for request and balancing logs - don't know where to put yet
-	return nil
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		ctx := req.Context()
+		reqCtx := context.WithValue(ctx, "req-id", req.Header.Get("X-Request-ID"))
+		h.ServeHTTP(rw, req.WithContext(reqCtx))
+	})
 }
 
 func (lb *LoadBalancer) serverInstancesHealthCheck(){
