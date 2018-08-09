@@ -1,4 +1,4 @@
-package server
+package main
 
 import (
 	"net/http"
@@ -11,7 +11,7 @@ import (
 func main(){
 
 	//read endpoints from input
-	endpoints := []string{"http://localhost:9000", "http://localhost:9001"}
+	endpoints := []string{"http://localhost:9000", "http://localhost:9001", "http://localhost:9002"}
 	//new lb
 	lb, err := lb.NewLoadBalancer(endpoints)
 	if err != nil {
@@ -19,7 +19,7 @@ func main(){
 	}
 
 	//http serve / to lb
-	http.HandleFunc("/", lb.Proxy)
+	http.Handle("/", lb.BalancerMiddleware(http.HandlerFunc(lb.Proxy)))
 	err = http.ListenAndServe(":8080", nil)
 	if err != nil {
 		log.Fatalf("unable to start server: %s", err.Error())
