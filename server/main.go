@@ -19,7 +19,7 @@ func main(){
 	}
 
 	//http serve / to lb
-	http.Handle("/", lb.BalancerMiddleware(http.HandlerFunc(lb.Proxy)))
+	http.Handle("/", lb.Middleware(http.HandlerFunc(lb.Balancer)))
 	err = http.ListenAndServe(":8080", nil)
 	if err != nil {
 		log.Fatalf("unable to start server: %s", err.Error())

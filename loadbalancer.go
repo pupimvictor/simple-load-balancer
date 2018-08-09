@@ -1,23 +1,24 @@
 package lb
 
 import (
-	"net/url"
-	"net/http"
 	"fmt"
+	"net/http"
+	"net/url"
 
 	"context"
 	"net/http/httputil"
+	"time"
 )
 
-type LoadBalancer struct{
-	backends []ServerInstance
+type LoadBalancer struct {
+	backends         []ServerInstance
 	healthyInstances *HealthyInstances
 }
 
-type ServerInstance struct{
-	id int
+type ServerInstance struct {
+	id       int
 	endpoint *url.URL
-	healthy bool
+	healthy  bool
 }
 
 type HealthyInstances struct {
@@ -25,11 +26,10 @@ type HealthyInstances struct {
 	nextInstance *HealthyInstances
 }
 
-
-func NewLoadBalancer(endpoints []string) (LoadBalancer, error){
+func NewLoadBalancer(endpoints []string) (LoadBalancer, error) {
 	serverInstances := make([]ServerInstance, len(endpoints))
 
-	for i, x := range endpoints{
+	for i, x := range endpoints {
 		url, err := url.Parse(x)
 		if err != nil {
 			return LoadBalancer{}, fmt.Errorf("error parsing url: %v", err)
@@ -43,54 +43,60 @@ func NewLoadBalancer(endpoints []string) (LoadBalancer, error){
 	return lb, nil
 }
 
-func (lb *LoadBalancer) Proxy(w http.ResponseWriter, req *http.Request) {
-	//responsible to dispach the request to the backend
-	ctx := req.Context()
-	serverInstance := ctx.Value("server-instance").(*ServerInstance)
-
-	reverseProxy := httputil.NewSingleHostReverseProxy(serverInstance.endpoint)
-
-	reverseProxy.ServeHTTP(w, req)
-}
-
-func (lb *LoadBalancer) BalancerMiddleware(h http.Handler) http.Handler{
+func (lb *LoadBalancer) Balancer(rw http.ResponseWriter, req *http.Request) {
 	//responsible for defining the right backend and retry mechanism
-	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		reqStatus := 0
-		serverInstance := lb.getNextHealthyServerInstance()
-		activeInstance := &serverInstance
-		firstInstanceId := activeInstance.currInstance.id
+	serverInstance := lb.getNextHealthyServerInstance()
+	activeInstance := &serverInstance
+	firstInstanceId := activeInstance.currInstance.id
 
-		scrw := NewStatusCodeResponseWriter(rw)
 
-		for reqStatus != 200 {
-			reqCtx := context.WithValue(req.Context(), "server-instance", activeInstance.currInstance)
+	scrw := rw.(*CustomResponseWriter)
 
-			h.ServeHTTP(scrw, req.WithContext(reqCtx))
-			reqStatus = scrw.statusCode
 
-			activeInstance = activeInstance.nextInstance
-			if activeInstance.currInstance.id == firstInstanceId{
-				break
-			}
+	for {
+		reverseProxy := httputil.NewSingleHostReverseProxy(activeInstance.currInstance.endpoint)
+		reverseProxy.ServeHTTP(scrw, req)
+
+		ctx := context.WithValue(req.Context(), "server-instance", activeInstance.currInstance)
+		req = req.WithContext(ctx)
+
+		if scrw.statusCode == 200 {
+			break
 		}
-	})
+
+		activeInstance = activeInstance.nextInstance
+		if activeInstance.currInstance.id == firstInstanceId {
+			fmt.Printf("req #%s failed: all backends are sick\n\n", req.Context().Value("req-id"))
+			break
+		}
+	}
+	scrw.ResponseWriter.WriteHeader(scrw.statusCode)
+	scrw.ResponseWriter.Write(scrw.body)
+
 }
 
-func (lb *LoadBalancer) LogMiddleware(h http.Handler) http.Handler{
+func (lb *LoadBalancer) Middleware(h http.Handler) http.Handler {
 	//logger middleware for request and balancing logs - don't know where to put yet
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		start := time.Now()
+		reqId := start.UnixNano() % 10000000000000
+
 		ctx := req.Context()
-		reqCtx := context.WithValue(ctx, "req-id", req.Header.Get("X-Request-ID"))
+		reqCtx := context.WithValue(ctx, "req-id", reqId)
 
-		//scrw := NewStatusCodeResponseWriter(rw)
+		scrw := NewCustomResponseWriter(rw)
 
-		h.ServeHTTP(rw, req.WithContext(reqCtx))
+		h.ServeHTTP(scrw, req.WithContext(reqCtx))
+
+		elapsed := time.Since(start)
+		fmt.Printf("request # %d\nresponse: %d, elapsed: %s\n\n", reqId, scrw.statusCode, elapsed)
 	})
 }
 
-func (lb *LoadBalancer) serverInstancesHealthCheck(){
+func (lb *LoadBalancer) serverInstancesHealthCheck() {
 	//call /_health for each one of the instances concurrently and update lb.Healthy instances
+
+
 	firstInst := &lb.backends[0]
 	head := &HealthyInstances{firstInst, nil}
 	prev := head
@@ -104,7 +110,7 @@ func (lb *LoadBalancer) serverInstancesHealthCheck(){
 	lb.healthyInstances = head
 }
 
-func (lb *LoadBalancer) getNextHealthyServerInstance() (HealthyInstances){
+func (lb *LoadBalancer) getNextHealthyServerInstance() HealthyInstances {
 
 	healthyInstances := *lb.healthyInstances
 	lb.healthyInstances = lb.healthyInstances.nextInstance
@@ -112,17 +118,21 @@ func (lb *LoadBalancer) getNextHealthyServerInstance() (HealthyInstances){
 	return healthyInstances
 }
 
-
-type statusCodeResponseWriter struct {
+type CustomResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
+	body       []byte
 }
 
-func (scrw *statusCodeResponseWriter) WriteHeader(code int) {
-	scrw.statusCode = code
-	scrw.ResponseWriter.WriteHeader(code)
+func (crw *CustomResponseWriter) Write(data []byte) (int, error) {
+	crw.body = data
+	return len(data), nil
 }
 
-func NewStatusCodeResponseWriter(w http.ResponseWriter) *statusCodeResponseWriter {
-	return &statusCodeResponseWriter{w, http.StatusOK}
+func (crw *CustomResponseWriter) WriteHeader(code int) {
+	crw.statusCode = code
+}
+
+func NewCustomResponseWriter(w http.ResponseWriter) *CustomResponseWriter {
+	return &CustomResponseWriter{w, http.StatusOK, nil}
 }
