@@ -4,10 +4,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync"
 
 	"context"
-	"golang.org/x/sync/errgroup"
-	"log"
 	"net/http/httputil"
 	"time"
 
@@ -19,6 +18,8 @@ import (
 type LoadBalancer struct {
 	backends         []ServerInstance
 	healthyInstances *HealthyInstances
+	healthCheckFn    func(inst ServerInstance, healthErr []error) (HealthCheckResp, []error)
+	mux sync.Mutex
 }
 
 type ServerInstance struct {
@@ -42,23 +43,17 @@ const healthCheckInterval = 10
 //This function creates a LoadBalancer instance using a ServerInstance for each one of the input endpoints.
 //The function calls lb.serverInstancesHealthCheck() that performs the health check for all the serverInstances and creates and assign to the LB a linked list HealthyInstances with the healthy serverInstances.
 //The function concurrently call the healthCheckJob that will perform the health check process on the interval defined by `const healthCheckInterval`
-func NewLoadBalancer(endpoints []string) (LoadBalancer, error) {
+func NewLoadBalancer(endpoints []*url.URL) (LoadBalancer, error) {
 	fmt.Printf("%s", endpoints)
 	serverInstances := make([]ServerInstance, len(endpoints))
 
 	for i, x := range endpoints {
-		url, err := url.Parse(x)
-		if err != nil {
-			return LoadBalancer{}, fmt.Errorf("error parsing url: %v", err)
-		}
-		serverInstances[i] = ServerInstance{i, url, false}
+		serverInstances[i] = ServerInstance{i, x, false}
 	}
 
-	lb := LoadBalancer{serverInstances, nil}
-
+	var mux sync.Mutex
+	lb := LoadBalancer{backends: serverInstances, healthyInstances: nil, healthCheckFn:checkInstanceHealth, mux: mux}
 	lb.serverInstancesHealthCheck()
-
-	go lb.startHealthCheckJob()
 
 	return lb, nil
 }
@@ -90,6 +85,7 @@ func (lb *LoadBalancer) Balancer(rw http.ResponseWriter, req *http.Request) {
 
 		fmt.Printf("request # %d, ep: %s\n", ctx.Value("req-id"), activeInstance.currInstance.endpoint)
 		if crw.StatusCode == 200 {
+			crw.Body = []byte(fmt.Sprintf("%d", activeInstance.currInstance.id))
 			break
 		}
 
@@ -99,9 +95,8 @@ func (lb *LoadBalancer) Balancer(rw http.ResponseWriter, req *http.Request) {
 			break
 		}
 	}
-	//This is where the CustomResponseWriter comes in place:
 	//When the reverseProxy serves the request to an instance, the response is written. If it is a fail, we want to retry, but it's not possible if the regular responseWriter has already written the response on the previous try.
-	//To solve this problem I've created the CustomResponseWriter that postpone the write operation, saving it in a local variable and then actually writing it to the response only after the loop breaks. see respwriter.go:
+	//To solve this problem a CustomResponseWriter was created to postpone the write operation, saving it in a local variable and then actually writing it to the response only after the loop breaks. see respwriter.go:
 	crw.WriteResponse()
 
 }
@@ -132,10 +127,9 @@ func (lb *LoadBalancer) Middleware(h http.Handler) http.Handler {
 
 //Get the next instance to balance the traffic
 //The strategy implemented is a simple Round Robin.
-//Important to notice that every time this method is called, it returns a copy of the current node of the linked list.
-// That's important to isolate every request with it's own control of the linked list, making it simpler to create a retry mechanism and avoid loosing references when the healthcheck refresh the healthyInstances list
 func (lb *LoadBalancer) getNextHealthyServerInstance() HealthyInstances {
-
+	lb.mux.Lock()
+	defer lb.mux.Unlock()
 	healthyInstances := *lb.healthyInstances
 	lb.healthyInstances = lb.healthyInstances.nextInstance
 
@@ -145,48 +139,44 @@ func (lb *LoadBalancer) getNextHealthyServerInstance() HealthyInstances {
 //Health check logic
 //The serverInstancesHealthCheck function calls /_health for each one of the instances concurrently and save the response back to the ServerInstance healty attribute on the lb.backend list
 //then update lb.HealthyInstances by calling the lb.buildHealthyList()
-func (lb *LoadBalancer) serverInstancesHealthCheck() {
+func (lb *LoadBalancer) serverInstancesHealthCheck() []error {
 
 	fmt.Println("health checking")
 
-	var wg errgroup.Group
+	//var wg errgroup.Group
+
+	var wg sync.WaitGroup
+	healthErr := make([]error, 3)
+
 	for _, x := range lb.backends {
 		inst := x
-		wg.Go(func() error {
-			healthUrl := fmt.Sprintf("%s/_health", inst.endpoint)
-			resp, err := http.Get(healthUrl)
-			if err != nil {
-				fmt.Printf("error pinging instance %s, %v", inst.endpoint.Host, err)
-			}
-			defer resp.Body.Close()
 
-			body, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				fmt.Errorf("error reading health response")
-			}
-
-			var instHealth HealthCheckResp
-			err = json.Unmarshal(body, &instHealth)
-			if err != nil {
-				fmt.Errorf("error unmarshal health response %v", err)
+		wg.Add(1)
+		go func(inst ServerInstance){
+			instHealth, hErr := lb.healthCheckFn(inst, healthErr)
+			healthErr = hErr
+			if len(healthErr) > 0 {
+				fmt.Printf("errors during health check of: %v", inst)
+				wg.Done()
+				return
 			}
 
 			lb.backends[inst.id].healthy = "healthy" == instHealth.State
 
 			fmt.Printf("instance %s is %s\n", inst.endpoint.Host, instHealth.State)
-			return nil
-		})
+			wg.Done()
+		}(inst)
 	}
+	wg.Wait()
 
-	if err := wg.Wait(); err != nil {
-		log.Fatalf("error health checking: %v", err)
+	if len(healthErr) > 0 {
+		return healthErr
 	}
-
-	lb.buildHealthyList()
+	return []error{lb.buildHealthyList()}
 }
 
 //This function traverses the lb.backends list filtering the healthy ServerInstances and creating a circular linked list
-func (lb *LoadBalancer) buildHealthyList() {
+func (lb *LoadBalancer) buildHealthyList() error {
 	//checks for the first healthy ServerInstance to be the first element of the list
 	var firstInst *ServerInstance
 	for _, x := range lb.backends {
@@ -200,7 +190,7 @@ func (lb *LoadBalancer) buildHealthyList() {
 	if firstInst == nil {
 		time.Sleep(1 * time.Second)
 		lb.serverInstancesHealthCheck()
-		return
+		return nil
 	}
 
 	//creates a circular list with the healthy instances
@@ -216,13 +206,41 @@ func (lb *LoadBalancer) buildHealthyList() {
 		prev = curr
 	}
 	prev.nextInstance = head
+
+	lb.mux.Lock()
+	defer lb.mux.Unlock()
 	lb.healthyInstances = head
+
+	return nil
 }
 
 //cron job to health check
-func (lb *LoadBalancer) startHealthCheckJob() {
+func (lb *LoadBalancer) StartHealthCheckJob() {
 	tick := time.Tick(healthCheckInterval * time.Second)
 	for range tick {
 		lb.serverInstancesHealthCheck()
 	}
+}
+func checkInstanceHealth(inst ServerInstance, healthErr []error) (HealthCheckResp, []error) {
+	healthUrl := fmt.Sprintf("%s/_health", inst.endpoint)
+	resp, err := http.Get(healthUrl)
+	if err != nil {
+		healthErr[0] = fmt.Errorf("error pinging instance %s, %v", inst.endpoint.Host, err)
+		return HealthCheckResp{}, healthErr
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		healthErr[1] = fmt.Errorf("error reading health response: %v", err)
+		return HealthCheckResp{}, healthErr
+	}
+
+	var instHealth HealthCheckResp
+	err = json.Unmarshal(body, &instHealth)
+	if err != nil {
+		healthErr[2] = fmt.Errorf("error unmarshal health response %v", err)
+		return HealthCheckResp{}, healthErr
+	}
+	return instHealth, healthErr
 }

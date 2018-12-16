@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-
-	"strings"
 )
 
 var port = "8080"
@@ -17,16 +15,17 @@ var port = "8080"
 func main() {
 
 	//read endpoints from input
-	var endpoints []string
+	var endpoints []*url.URL
 
 	fmt.Printf("%s", os.Args)
 	for i := 1; i < len(os.Args); i = i + 2 {
 		if os.Args[i] == "-b" {
-			if _, err := url.Parse(os.Args[i+1]); err != nil {
+			url, err := url.Parse(os.Args[i+1])
+			if err != nil {
 				fmt.Errorf("invalid url input\n")
 				return
 			}
-			endpoints = append(endpoints, strings.Trim(os.Args[i+1], " "))
+			endpoints = append(endpoints, url)
 		} else if os.Args[i] == "-p" {
 			port = os.Args[i+1]
 		}
@@ -37,6 +36,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("unable to start lb - %s", err.Error())
 	}
+
+	go lb.StartHealthCheckJob()
 
 	//http serve / to lb
 	http.Handle("/", lb.Middleware(http.HandlerFunc(lb.Balancer)))
